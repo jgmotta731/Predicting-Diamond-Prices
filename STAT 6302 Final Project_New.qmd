@@ -1,0 +1,951 @@
+---
+title: "STAT 6302 Final Project"
+author: "Jack Motta"
+format: 
+  html:
+    embed-resources: true
+    code-fold: show
+    toc: true
+editor: visual
+---
+
+# Overview
+
+## Attributes
+
+-   53,940 diamonds w/ 11 variables
+
+-   Original Predictors:
+
+    -   Carat
+
+    -   Cut
+
+    -   Color: From "J" (worst) to "D" (best)
+
+    -   Clarity:
+
+        -   From worst to best: I1, SI2, SI1, VS2, VS1, VVS2, VVS1, IF
+
+    -   Length (x), width (y), and depth (z) in mm
+
+    -   Total depth percentage (depth) $= 2 * z / (x + y)$
+
+    -   Table: width of top of diamond relative to widest point
+
+-   Outcome is price
+
+-   9 predictors (w/ feature engineering and not including ID variable)
+
+-   Technically no missing values
+
+-   Apparent data entry error for x, y, and z due to having values of zero, so set them to equal "NA" and then use KNN imputation. 35 total missing values after setting them equal to NA.
+
+## Objective
+
+-   Build accurate predictive price model
+
+-   Compare Boosting vs Random Forest vs Penalized Regression model
+
+-   Prediction over inference
+
+## Methodology
+
+-   Perform data preprocessing as see fit (detailed below)
+
+-   Perform EDA to see what predictor to fit cubic spline on (with 3 df)
+
+-   Perform 70/30 training test split to make it less computationally expensive
+
+-   RMSE as primary performance metric with R-squared and MSE as secondary metrics
+
+-   IML to find variable importance
+
+### Feature Engineering
+
+-   Created approx. volume: $length * width * depth$. Captures the overall size of the diamond, which is likely to have a significant impact on the diamond's price and overall quality.
+
+-   Use aspect ratio ($length/width$) to approximate the diamond's shape using the common aspect ratios for each shape.
+
+    -   Then create shape
+
+-   Approx. Surface Area: $4\pi((x^py^p + x^pz^p + y^pz^p) / 3)^{(1/p)}$ where $p=1.6075$, x = length, y = width, and z = depth.
+
+    -   Approximates the diamond as an ellipsoid (assuming ellipsoid to simplify complex facet of the diamonds). The surface area might correlate with the diamond's brilliance and sparkle as it relates to how much light can interact with the surface, potentially affecting its desirability and price.
+
+-   Rename ID variable from "X" to "ID"
+
+### Preprocessing Steps (RF and XGB)
+
+-   Update role ID
+
+-   Mutate feature engineering (aspect ratio, shape, volume, surface area)
+
+-   KNN imputation for length (x), width (y), and depth (z) due to certain diamonds having values of 0 for them which isn't possible, so likely data entry error
+
+-   Use aspect ratio to determine shape and then remove aspect ratio as a predictor along with x, y, and z
+
+-   Normalize all numeric predictors
+
+-   One hot dummy encoding all nominal predictors
+
+### Preprocessing Steps (Penalized Regression and Linear Regression)
+
+-   Update role ID
+
+-   Create previously unseen factor levels
+
+-   KNN imputation for all predictors, but more specifically for x, y, and z due to certain diamonds having values of 0 for them which isn't possible, so likely data entry error
+
+-   Mutate feature engineering (aspect ratio, shape, volume, surface area)
+
+-   Use aspect ratio to determine shape and then remove aspect ratio as a predictor along with x, y, and z
+
+-   Remove x, y, z, and aspect ratio to avoid redundancy
+
+-   Log transformation on price
+
+-   Remove near zero variances
+
+-   Remove correlated predictors with threshold of 0.8
+
+-   Normalize (center and scale) all numeric predictors
+
+-   Dummy all nominal predictors
+
+-   Fit a cubic spline with 3 degrees of freedom (to balance flexibility and overfitting) on variable of choice after checking relationships between predictors and price (chosen variable: volume)
+
+### Model Tuning
+
+-   Grid size of 5 to make it less computationally extensive
+
+-   Random Forest: tuning minimum node size, set trees equal to 500, and set number of predictors randomly sampled to 3 because $9/3=3$)
+
+-   XGBoost: Tuning max depth of each tree, learning rate, minimum amount of loss reduction, size of subsample, minimum node size, and max number of boosting iterations, while also setting trees equal to 500 and number of predictors randomly samples to 3
+
+-   Penalized Regression: Elastic Net, tuning both penalty and mixture.
+
+# Library
+
+```{r, warning=FALSE, message=FALSE}
+library(tidymodels)
+library(tidyverse)
+library(dplyr)
+library(vip)
+library(iml)
+library(ggplot2)
+library(xgboost)
+library(ranger)
+library(ggthemes)
+library(doParallel)
+library(themis)
+library(future)
+library(future.callr)
+library(finetune)
+library(probably)
+library(pdp)
+library(yardstick)
+library(gtsummary)
+library(gridExtra)
+library(dials)
+library(rpart)
+library(rpart.plot)
+```
+
+# Load Data
+
+```{r, warning=FALSE, message=FALSE}
+# Load the dataset
+diamonds <- read.csv("C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/diamonds.csv")
+
+# Rename X to ID
+diamonds <- diamonds %>% 
+  rename(ID = X)
+
+# Convert Character variables into factors
+diamonds$cut <- as.factor(diamonds$cut)
+diamonds$color <- as.factor(diamonds$color)
+diamonds$clarity <- as.factor(diamonds$clarity)
+
+# Diamonds can't have zero dimensions if they exist
+zero_dimensions <- diamonds[diamonds$x == 0 | diamonds$y == 0 | diamonds$z == 0, ]
+print(zero_dimensions)
+
+diamonds$x[diamonds$x == 0] <- NA
+diamonds$y[diamonds$y == 0] <- NA
+diamonds$z[diamonds$z == 0] <- NA
+sum(is.na(diamonds))
+```
+
+# Outlier Investigation
+
+```{r, warning=FALSE, message=FALSE}
+diamonds[c(24066:24070),c(9:11)] # outlier at 24068 for measurements
+diamonds[c(48409:48413),c(9:11)] # outlier at 48411 for measurements
+diamonds[c(49188:49192),c(9:11)] # outlier at 49190 for measurements
+
+# Set equal to NAs and use KNN Imputation to resolve
+
+diamonds$x[diamonds$x > 30] <- NA
+diamonds$y[diamonds$y > 30] <- NA
+diamonds$z[diamonds$z > 30] <- NA
+```
+
+# Feature Engineering
+
+```{r, message=FALSE, warning=FALSE}
+# Set p to common value used for approximating ellipsoid surface area
+p <- 1.6075
+# Calculate aspect ratio for each diamond
+diamonds <- diamonds %>%
+  mutate(
+    volume = x * y * z,
+    aspect_ratio = round(x / y, 2),
+    surface_area = 4 * pi * ((x^p * y^p + x^p * z^p + y^p * z^p) / 3)^(1/p),
+    shape = as.factor(case_when(
+      aspect_ratio == 1 ~ "Round",
+      aspect_ratio > 1 & aspect_ratio <= 1.05 ~ "Princess",
+      aspect_ratio <= 1.10 & aspect_ratio != 1 ~ "Heart",
+      (aspect_ratio >= 1.3 & aspect_ratio <= 1.5) ~ "Oval",
+      (aspect_ratio >= 1.85 & aspect_ratio <= 2.1) ~ "Marquise",
+      (aspect_ratio >= 1.45 & aspect_ratio <= 1.75) ~ "Pear",
+      (aspect_ratio >= 1.3 & aspect_ratio <= 1.6) ~ "Emerald",
+      (aspect_ratio > 1 & aspect_ratio <= 1.05) ~ "Asscher",
+      (aspect_ratio > 1 & aspect_ratio <= 1.30) ~ "Cushion",
+      (aspect_ratio > 1 & aspect_ratio <= 1.35) ~ "Radiant",
+      TRUE ~ "Unknown"  # Fallback case
+  ))) %>%
+  select(-c(x, y, z, aspect_ratio)) # Exclude from summary
+```
+
+# Summary Table
+
+```{r, warning=FALSE, message=FALSE}
+summary_data <- diamonds %>%
+  select(-ID)
+
+# Plot distributions
+num_bins <- function(n) ceiling(1 + log2(n))
+hist_plots <- lapply(names(summary_data)[sapply(summary_data, is.numeric)], function(var) {
+  ggplot(summary_data, aes_string(x = var)) +
+    geom_histogram(bins = num_bins(nrow(summary_data)), fill = "#0073C2FF", color = "#003350") +
+    labs(title = paste("Distribution of", str_to_title(var)),
+         x = str_to_title(var), 
+         y = "Count") + 
+    theme_minimal() +
+    theme(plot.title = element_text(hjust = 0.5))
+})
+do.call(grid.arrange, c(hist_plots, ncol = 2))
+
+summary_table <- tbl_summary(
+  data = summary_data,
+  by = NULL, # No grouping variable since we want a summary of the entire dataset
+  type = list(
+    carat ~ "continuous2",
+    depth ~ "continuous2",
+    table ~ "continuous2",
+    price ~ "continuous2",
+    volume ~ "continuous2",
+    surface_area ~ "continuous2",
+    all_categorical() ~ "categorical"),
+  statistic = list(
+    carat ~ c("{median}","{IQR}"),
+    price ~ c("{median}","{IQR}"),
+    volume ~ c("{median}","{IQR}"),
+    surface_area ~ c("{median}","{IQR}"),
+    depth ~ c("{mean}", "{sd}"),
+    table ~ c("{mean}", "{sd}"),
+    all_categorical() ~ "{p}% ({n})"),
+  missing_text = "No. of NAs",
+  label = list(
+    carat = "Carat",
+    cut = "Cut",
+    color = "Color",
+    clarity = "Clarity",
+    depth = "Total Depth Percentage",
+    table = "Width of Top of Diamond",
+    volume = "Volume",
+    surface_area = "Surface Area",
+    shape = "Shape",
+    price = "Price"
+  )) %>%
+  as_gt() %>%
+  gt::tab_header(
+    title = "**Table 1: Diamond Summary Statistics**")
+summary_table
+```
+
+# Data Split
+
+```{r, warning=FALSE, message=FALSE}
+# Training-Test Split
+set.seed(6302)
+diamonds_split <- initial_split(diamonds, prop = 0.70)
+diamonds_train <- training(diamonds_split)
+diamonds_test  <-  testing(diamonds_split)
+# Set k rule of thumb
+k_rule_of_thumb <- round(sqrt(nrow(diamonds_train))) 
+
+set.seed(6302)
+cv_folds <- vfold_cv(diamonds_train, v = 10, repeats = 5)
+
+# Prepare the recipe
+diamonds_recipe <- recipe(price ~ ., data = diamonds_train) %>%
+  update_role(ID, new_role = "ID") %>%
+  step_novel(all_nominal_predictors(), new_level = "Other") %>%
+  step_impute_knn(all_predictors(), neighbors = k_rule_of_thumb) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = TRUE)
+
+ncores <- 6
+```
+
+# Model Building
+
+## Random Forest Model
+
+```{r, message=FALSE, warning=FALSE}
+rm(hist_plots, p, num_bins, summary_table, zero_dimensions, diamonds)
+
+# Define the model specification
+rf_model <- rand_forest(trees = 500, mtry = 3, min_n = tune()) %>%
+            set_engine("ranger", importance = "impurity") %>%
+            set_mode("regression")
+rf_wflow <- workflow() %>% 
+  add_model(rf_model) %>% 
+  add_recipe(diamonds_recipe)
+
+# Use space filling design
+rf_param <- extract_parameter_set_dials(rf_model) %>%
+  dials::finalize(juice(prep(diamonds_recipe)))
+glh_rf <- grid_latin_hypercube(rf_param, size = 5)
+# Model Tuning w/ parallel processing
+cl <- makeCluster(ncores)
+registerDoParallel(cl)
+set.seed(6302)
+rf_tune <- tune_grid(
+  rf_wflow,
+  resamples = cv_folds,
+  grid = glh_rf)
+stopCluster(cl)
+registerDoSEQ() 
+saveRDS(rf_tune, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/rf_tune1.rds')
+rf_tune <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/rf_tune1.rds')
+
+# Select the best model
+best_rf_params <- select_best(rf_tune, metric = "rmse")
+best_rf_params
+# Finalize model
+rf_model2 <- finalize_model(rf_model, best_rf_params)
+# Update workflow
+rf_wflow2 <- rf_wflow %>%
+  update_model(rf_model2)
+
+# Fit Resamples
+ctrl <- control_resamples(save_pred = TRUE)
+resamples_rf <- fit_resamples(
+              rf_wflow2,
+              resamples = cv_folds,
+              control = ctrl,
+              metrics = metric_set(rmse, mae, rsq))
+saveRDS(resamples_rf, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_rf1.rds')
+resamples_rf <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_rf1.rds')
+resamples_rf %>% collect_metrics()
+
+# Last Fit
+final_rf_fit <- last_fit(rf_wflow2, diamonds_split, 
+			              metrics = metric_set(yardstick::rmse, yardstick::mae, yardstick::rsq))
+saveRDS(final_rf_fit, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/final_rf_fit1.rds')
+final_rf_fit <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/final_rf_fit1.rds')
+final_rf_fit %>% collect_metrics()
+
+# Extract the fit for interpretable ML
+rf_engine <- extract_fit_engine(final_rf_fit)
+rf_juice <- juice(prep(diamonds_recipe))
+rf.price <- rf_juice$price
+diamonds_data.rf <- rf_juice %>%
+  select(-ID, -price)
+
+# IML setup for ranger
+pfun.ranger <- function(model, newdata) {
+  predict(model, data = newdata, type = "response")$predictions
+}
+predictor.rf <- Predictor$new(
+  model = rf_engine,
+  data = diamonds_data.rf,
+  y = rf.price,
+  predict.fun = pfun.ranger)
+```
+
+## XGBoost
+
+```{r, message=FALSE, warning=FALSE}
+rm(resamples_rf, rf_juice, best_rf_params, glh_rf, rf_param, rf_model, rf_wflow, rf_tune)
+
+xgb_model <- boost_tree(
+                  mode = "regression", mtry = 3, trees = 500, tree_depth = tune(),
+                  min_n = tune(), loss_reduction = tune(), learn_rate = tune(),
+                  sample_size = tune(), stop_iter = tune()) %>%
+                  set_mode("regression") %>%
+                  set_engine("xgboost")
+xgb_wf <- workflow() %>% 
+                    add_recipe(diamonds_recipe) %>% 
+                    add_model(xgb_model)
+
+boost_param <- extract_parameter_set_dials(xgb_model) %>% 
+  dials::finalize(juice(prep(diamonds_recipe, training = diamonds_train)))
+glh_boost <- grid_latin_hypercube(boost_param, size = 5)
+
+# Tune parameters
+cl <- makeCluster(ncores)
+registerDoParallel(cl)
+set.seed(6302)
+xgb_tune <- tune_grid(
+   xgb_wf,
+   resamples = cv_folds,
+   grid = glh_boost)
+stopCluster(cl)
+registerDoSEQ()
+saveRDS(xgb_tune, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/xgb_tune.rds1')
+xgb_tune <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/xgb_tune.rds1')
+# Show optimal tuning parameters
+xgb_param <- xgb_tune %>% select_best(metric = "rmse")
+xgb_param
+
+# Finalize Model
+xgb_model2 <- finalize_model(xgb_model, xgb_param)
+# Update Workflow
+xgb_wflow2 <- xgb_wf %>%
+  update_model(xgb_model2)
+
+# Fit Resamples
+resamples_xgb <- fit_resamples(
+              xgb_wflow2,
+              resamples = cv_folds,
+              control = ctrl,
+              metrics = metric_set(rmse, mae, rsq))
+saveRDS(resamples_xgb, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_xgb.rds1')
+resamples_xgb <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_xgb.rds1')
+resamples_xgb %>% collect_metrics()
+
+final_xgb_fit <- last_fit(xgb_wflow2, diamonds_split, 
+			              metrics = metric_set(yardstick::rmse, yardstick::mae, yardstick::rsq))
+saveRDS(final_xgb_fit, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/final_xgb_fit.rds1')
+final_xgb_fit <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/final_xgb_fit.rds1') 
+final_xgb_fit %>% collect_metrics()
+
+xgb_juice <- juice(prep(diamonds_recipe))
+xgb_engine <- extract_fit_engine(final_xgb_fit)
+diamonds_data.xgb <- xgb_juice %>%
+                dplyr::select(-ID, -price)
+# IML for XGBoost
+pfun.xgb <- function(model, newdata){
+  newData_x <- xgb.DMatrix(data.matrix(newdata), missing = NA)
+  results <- predict(model, newData_x)
+  return(results)
+}
+xgb_reg.price <- xgb_juice$price
+predictor.xgb <- Predictor$new(model = xgb_engine, 
+                               data = diamonds_data.xgb, 
+                               y = xgb_reg.price,
+                               predict.fun = pfun.xgb)
+```
+
+## Penalized Regression (Elastic Net)
+
+```{r, warning=FALSE, message=FALSE}
+rm(resamples_xgb, xgb_model, xgb_wf, xgb_juice, xgb_param, boost_param, glh_boost, xgb_tune)
+
+glmnet_recipe <- recipe(price ~ ., data = diamonds_train) %>%
+  update_role(ID, new_role = "ID") %>%
+  step_impute_knn(all_predictors(), neighbors = k_rule_of_thumb) %>%
+  step_log(all_outcomes(), offset = 1e-10) %>%
+  step_nzv(all_predictors()) %>%
+#  step_corr(all_numeric_predictors(), threshold = .8) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes())
+
+# Check loess plots again after recipe
+glmnet_baked <- bake(prep(glmnet_recipe), new_data = NULL)
+set.seed(6302)
+sampled_data <- glmnet_baked %>% sample_n(500)
+predictors <- c("volume", "table", "depth")
+loess_plots <- lapply(predictors, function(pred) {
+  ggplot(sampled_data, aes(x = !!sym(pred), y = !!sym("price"))) +
+    geom_point(alpha = 0.4) +
+    geom_smooth(method = "loess", formula = y ~ x, span = 0.75) +
+    labs(title = paste("Relationship between", pred, "and Price")) +
+    theme_minimal()
+})
+do.call(grid.arrange, c(loess_plots, ncol = 2))
+```
+
+```{r, message=FALSE, warning=FALSE}
+rm(loess_plots, predictors, sampled_data, glmnet_baked)
+
+glmnet_recipe <- recipe(price ~ ., data = diamonds_train) %>%
+  update_role(ID, new_role = "ID") %>%
+  step_impute_knn(all_predictors(), neighbors = k_rule_of_thumb) %>%
+  step_ns(volume, deg_free = 3) %>%
+  step_log(all_outcomes(), offset = 1e-10) %>%
+  step_nzv(all_predictors()) %>%
+  step_corr(all_numeric_predictors(), threshold = .8) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_center(all_numeric_predictors()) %>%
+  step_scale(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes())
+
+glmnet_baked <- bake(prep(glmnet_recipe), new_data = NULL)
+lm.1 <- lm(price ~ ., data = glmnet_baked)
+plot(lm.1) # assumptions not met for penalized regression, still proceed but without being able to interpret or generalize results
+```
+
+```{r, message=FALSE, warning=FALSE}
+rm(glmnet_baked, lm.1)
+
+glmnet_model <- linear_reg(penalty = tune(), mixture = tune()) %>%
+  set_mode("regression") %>%
+  set_engine("glmnet")
+glmnet_wflow <- workflow() %>%
+  add_recipe(glmnet_recipe) %>%
+  add_model(glmnet_model)
+glmnet_param <- extract_parameter_set_dials(glmnet_model) %>%
+  dials::finalize(juice(prep(glmnet_recipe)))
+glmnet_glh <- grid_latin_hypercube(glmnet_param, size = 5) # Define a grid of hyperparameters for tuning
+
+# Tune the model w/ parallel processing
+cl <- makeCluster(ncores)
+registerDoParallel(cl)
+set.seed(6302)
+glmnet_tune <- tune_grid(
+  object = glmnet_wflow,
+  resamples = cv_folds,
+  grid = glmnet_glh)
+stopCluster(cl)
+registerDoSEQ() 
+saveRDS(glmnet_tune, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_tune.rds')
+glmnet_tune <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_tune.rds')
+glmnet_best_tune <- select_best(glmnet_tune, metric = "rmse")
+glmnet_best_tune
+
+# Update model using optimal parameters
+glmnet_model2 <- finalize_model(glmnet_model, glmnet_best_tune)
+# Update workflow
+glmnet_wflow2 <- glmnet_wflow %>% 
+  update_model(glmnet_model2)
+# Solution path plot
+glmnet_path <- glmnet_wflow2 %>%
+  fit(diamonds_train) %>%
+  extract_fit_parsnip()
+plot(glmnet_path$fit)
+
+# test model performance with cross-validation
+glmnet_resample <- fit_resamples(
+  glmnet_wflow2,
+  resamples = cv_folds,
+  control = ctrl,
+  metrics = metric_set(yardstick::rmse, yardstick::mae, yardstick::rsq))
+saveRDS(glmnet_resample, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_resample.rds')
+glmnet_resample <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_resample.rds')
+glmnet_resample %>% collect_metrics()
+
+glmnet_last_fit <- last_fit(glmnet_wflow2, diamonds_split, 
+			              metrics = metric_set(yardstick::rmse, yardstick::mae, yardstick::rsq))
+saveRDS(glmnet_last_fit, 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_last_fit.rds')
+glmnet_last_fit <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_last_fit.rds')
+glmnet_last_fit %>% collect_metrics()
+
+glmnet_fit <- glmnet_wflow2 %>%
+  fit(diamonds_train)
+glmnet_coef <- tidy(glmnet_fit)
+glmnet_coef[-3]
+glmnet_engine <- extract_fit_engine(glmnet_last_fit)
+
+# Exponentiate metrics
+glmnet_predictions <- glmnet_last_fit %>%
+  collect_predictions()
+# Bind the predictions to the test data to calculate residuals
+glmnet_residuals <- glmnet_predictions %>%
+  select(price, .pred) %>%
+  mutate(
+    fitted = exp(.pred),
+    residual = exp(price) - fitted,
+    squared_residual = residual^2,  # Squared differences for RMSE
+    absolute_residual = abs(residual)
+  )
+```
+
+# Model Comparison
+
+```{r, message=FALSE, warning=FALSE}
+# Extract and reshape metrics for Random Forest
+rf_metrics <- final_rf_fit %>%
+  collect_metrics() %>%
+  mutate(Model = "Random Forest")
+
+# Extract and reshape metrics for XGBoost
+xgb_metrics <- final_xgb_fit %>%
+  collect_metrics() %>%
+  mutate(Model = "XGBoost")
+
+# Extract and reshape metrics for Elastic Net
+rmse <- sqrt(mean(glmnet_residuals$squared_residual, na.rm = TRUE))
+mae <- mean(glmnet_residuals$absolute_residual, na.rm = TRUE)
+mean_actual <- mean(exp(glmnet_residuals$price), na.rm = TRUE)
+tss <- sum((exp(glmnet_residuals$price) - mean_actual)^2, na.rm = TRUE)
+rss <- sum(glmnet_residuals$squared_residual, na.rm = TRUE)
+rsq <- 1 - (rss / tss)
+glmnet_metrics <- tibble(
+  rmse = rmse,
+  mae = mae,
+  rsq = rsq,
+  Model = "Elastic Net"
+)
+
+# Combine both results into one dataframe
+combined_metrics <- bind_rows(rf_metrics, xgb_metrics) %>%
+  select(Model, .metric, .estimate) %>%
+  pivot_wider(
+    names_from = .metric, 
+    values_from = .estimate)
+combined_metrics <- bind_rows(combined_metrics, glmnet_metrics)
+
+# Rename the columns appropriately
+result_table <- combined_metrics %>%
+  rename(RMSE = rmse, MAE = mae, RSQ = rsq)
+print(result_table)
+```
+
+# Resamples Comparison
+
+```{r}
+# resamples
+glmnet_resample <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/glmnet_resample.rds')
+resamples_xgb <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_xgb.rds1')
+resamples_rf <- readRDS( 'C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/resamples_rf1.rds')
+
+rf_res_met <- resamples_rf %>%
+  collect_metrics() %>%
+  mutate(Model = "Random Forest")
+
+# Extract and reshape metrics for XGBoost
+xgb_res_met <- resamples_xgb %>%
+  collect_metrics() %>%
+  mutate(Model = "XGBoost")
+xgb_res_met
+# Extract and reshape resample metrics for Elastic Net
+glmnet_pred_res <- glmnet_resample %>%
+  collect_predictions()
+# Bind the predictions to the test data to calculate residuals
+glmnet_residuals_resample <- glmnet_pred_res %>%
+  select(price, .pred) %>%
+  mutate(
+    fitted = exp(.pred),
+    residual = exp(price) - fitted,
+    squared_residual = residual^2,  # Squared differences for RMSE
+    absolute_residual = abs(residual)
+  )
+# Extract and reshape metrics for Elastic Net
+rmse <- sqrt(mean(glmnet_residuals_resample$squared_residual, na.rm = TRUE))
+mae <- mean(glmnet_residuals_resample$absolute_residual, na.rm = TRUE)
+mean_actual <- mean(exp(glmnet_residuals_resample$price), na.rm = TRUE)
+tss <- sum((exp(glmnet_residuals_resample$price) - mean_actual)^2, na.rm = TRUE)
+rss <- sum(glmnet_residuals_resample$squared_residual, na.rm = TRUE)
+rsq <- 1 - (rss / tss)
+glmnet_metrics_resample <- tibble(
+  rmse = rmse,
+  mae = mae,
+  rsq = rsq,
+  Model = "Elastic Net"
+)
+# Combine both results into one dataframe
+combined_metrics_resample <- bind_rows(rf_res_met, xgb_res_met) %>%
+  select(Model, .metric, mean) %>%
+  pivot_wider(
+    names_from = .metric, 
+    values_from = mean)
+combined_metrics2 <- bind_rows(combined_metrics_resample, glmnet_metrics_resample)
+
+# Rename the columns appropriately
+result_table2 <- combined_metrics2 %>%
+  rename(RMSE = rmse, MAE = mae, RSQ = rsq)
+print(result_table2)
+```
+
+# Visualizations
+
+## Partial Dependence Plots
+
+### Random Forest
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE, echo=FALSE}
+rm(glmnet_resample, glmnet_tune, glmnet_best_tune, glmnet_wflow, glmnet_model, glmnet_path)
+
+pdp_surface_area.rf <- partial(rf_engine, pred.var = "surface_area", train = diamonds_data.rf) 
+pdp_volume.rf <- partial(rf_engine, pred.var = "volume", train = diamonds_data.rf)
+pdp_carat.rf <- partial(rf_engine, pred.var = "carat", train = diamonds_data.rf)
+pdp_depth.rf <- partial(rf_engine, pred.var = "depth", train = diamonds_data.rf)
+# Surface area
+ggplot(pdp_surface_area.rf, aes(x=surface_area, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "Random Forest", x = "Surface Area", y = "Predicted Price") +
+  theme_minimal()
+# Volume
+ggplot(pdp_volume.rf, aes(x=volume, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "Random Forest", x = "Volume", y = "Predicted Price") +
+  theme_minimal()
+# Carat
+ggplot(pdp_carat.rf, aes(x=carat, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "Random Forest", x = "Carat", y = "Predicted Price") +
+  theme_minimal()
+# Depth percentage
+ggplot(pdp_depth.rf, aes(x=depth, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "Random Forest", x = "Total Depth Percentage", y = "Predicted Price") +
+  theme_minimal()
+```
+
+### XGBoost
+
+```{r, message=FALSE, warning=FALSE}
+rm(pdp_carat.rf, pdp_volume.rf, pdp_surface_area.rf)
+
+# Partial Dependence Plot XGBoost
+pdp_surface_area.xgb <- partial(xgb_engine, pred.var = "surface_area", train = diamonds_data.xgb)
+pdp_volume.xgb <- partial(xgb_engine, pred.var = "volume", train = diamonds_data.xgb)
+pdp_carat.xgb <- partial(xgb_engine, pred.var = "carat", train = diamonds_data.xgb)
+pdp_depth.xgb <- partial(xgb_engine, pred.var = "depth", train = diamonds_data.xgb)
+# Surface area
+ggplot(pdp_surface_area.xgb, aes(x=surface_area, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "XGBoost", x = "Surface Area", y = "Predicted Price") +
+  theme_minimal()
+# Volume
+ggplot(pdp_volume.xgb, aes(x=volume, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "XGBoost", x = "Volume", y = "Predicted Price") +
+  theme_minimal()
+# Carat
+ggplot(pdp_carat.xgb, aes(x=carat, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "XGBoost", x = "Carat", y = "Predicted Price") +
+  theme_minimal()
+ggplot(pdp_depth.xgb, aes(x=depth, y=yhat)) +
+  geom_point() +
+  geom_line() +
+  labs(title = "Partial Dependence Plot", subtitle = "XGBoost", x = "Total Depth Percentage", y = "Predicted Price") +
+  theme_minimal()
+```
+
+## Variable Importance Plots
+
+### Random Forest
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE, echo=FALSE}
+rm(pdp_surface_area.xgb, pdp_carat.xgb, pdp_volume.xgb)
+
+# VIP random forest
+# Feature Importance IML
+plan(callr, workers = 6)
+imp.rf <- FeatureImp$new(predictor.rf, loss = "mse")
+plan(sequential)
+imp_data.rf <- imp.rf$results
+lower_ci.rf <- imp_data.rf$importance.05
+upper_ci.rf <- imp_data.rf$importance.95
+ggplot(imp_data.rf, aes(x = importance, y = reorder(feature, importance))) +
+  geom_point(stat="identity", size=1.5, color="black") +
+  geom_errorbar(aes(xmin = lower_ci.rf, xmax = upper_ci.rf), width = 0.5) +  # Adjust width as needed
+  labs(title = "Variable Importance Plot", subtitle = "Random Forest", x = "Feature (loss: mse)", y = "Importance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 3),
+        axis.text.y = element_text(hjust = 0.5))
+```
+
+### XGBoost
+
+```{r, message=FALSE, warning=FALSE}
+rm(imp.rf, imp_data.rf, lower_ci.rf, upper_ci.rf)
+
+# VIP xgboost
+plan(callr, workers = 6)
+imp.xgb <- FeatureImp$new(predictor.xgb, loss = "mse")
+plan(sequential)
+imp_data.xgb <- imp.xgb$results
+lower_ci.xgb <- imp_data.xgb$importance.05
+upper_ci.xgb <- imp_data.xgb$importance.95
+ggplot(imp_data.xgb, aes(x = importance, y = reorder(feature, importance))) +
+  geom_point(stat="identity", size=1.5, color="black") +
+  geom_errorbar(aes(xmin = lower_ci.xgb, xmax = upper_ci.xgb), width = 0.5) +  # Adjust width as needed
+  labs(title = "Variable Importance Plot", subtitle = "XGBoost", x = "Feature (loss: mse)", y = "Importance") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 0, hjust = 0.5, vjust = 3),
+        axis.text.y = element_text(hjust = 0.5))
+```
+
+### Penalized Regression
+
+```{r, message=FALSE, warning=FALSE, echo=FALSE, eval=FALSE}
+rm(imp.xgb, imp_data.xgb, lower_ci.xgb, upper_ci.xgb)
+
+# VIP Penalized Regression
+glmnet_coef <- tidy(glmnet_fit)
+glmnet_coef <- glmnet_coef[-3]
+glmnet_coef <- glmnet_coef[-1,]
+glmnet_coef <- as.data.frame(glmnet_coef)
+glmnet_coef$estimate <- abs(glmnet_coef$estimate)
+glmnet_vip <- glmnet_coef %>% 
+  rename(importance = estimate)
+glmnet_vip <- glmnet_vip[order(-glmnet_vip$importance),]
+ggplot(glmnet_vip, aes(x = reorder(term, importance), y = importance)) +
+  geom_point(fill = "black") +
+  labs(title = "Variable Importance",
+       subtitle = "Elastic Net",
+       x = "Feature",
+       y = "Importance") +
+  coord_flip() +  # Flips the axes for easier reading of terms
+  theme_minimal()
+```
+
+## ALE Plots
+
+### Random Forest
+
+```{r, message=FALSE, warning=FALSE, eval=FALSE}
+rm(glmnet_coef, glmnet_vip)
+
+plan(callr, workers=6)
+# Surface Area
+ale_surface_area.rf <- FeatureEffect$new(predictor.rf, feature = "surface_area", method='ale')
+# Volume
+ale_volume.rf <- FeatureEffect$new(predictor.rf, feature = "volume", method='ale')
+# Total Depth Percentage
+ale_depth.rf <- FeatureEffect$new(predictor.rf, feature = "depth", method='ale')
+# Carat
+ale_carat.rf <- FeatureEffect$new(predictor.rf, feature = "carat", method='ale')
+plot(ale_surface_area.rf)
+plot(ale_volume.rf)
+plot(ale_carat.rf)
+plot(ale_depth.rf)
+
+plan(sequential)
+```
+
+### XGBoost
+
+```{r, message=FALSE, warning=FALSE}
+rm(ale_surface_area.rf, ale_volume.rf, ale_carat.rf)
+plan(callr, workers = 6)
+## Surface Area
+ale_surface_area.xgb <- FeatureEffect$new(predictor.xgb, feature = "surface_area", method='ale')
+# Volume
+ale_volume.xgb <- FeatureEffect$new(predictor.xgb, feature = "volume", method='ale')
+# Carat
+ale_carat.xgb <- FeatureEffect$new(predictor.xgb, feature = "carat", method='ale')
+# Total Depth Percentage
+ale_depth.xgb <- FeatureEffect$new(predictor.xgb, feature = "depth", method='ale')
+plot(ale_surface_area.xgb)
+plot(ale_volume.xgb)
+plot(ale_carat.xgb)
+plot(ale_depth.xgb)
+
+plan(sequential)
+```
+
+## Residuals vs Fitted Values (Penalized Regression)
+
+```{r, warning=FALSE, message=FALSE, eval=FALSE}
+# Plotting Residuals vs. Fitted Values
+ggplot(glmnet_residuals, aes(x = fitted, y = residual)) +
+  geom_point(alpha = 0.5) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(x = "Fitted Values", y = "Residuals", title = "Residuals vs Fitted Plot for Elastic Net Model") +
+  theme_minimal()
+```
+
+# New Test Data
+```{r}
+# Test Model Performance on new unseen data
+diamonds_new <- read.csv("C:/Users/jgmot/OneDrive/Documents/Data Projects/Kaggle Datasets/training.csv")
+diamonds_new <- diamonds_new %>%
+  separate(Measurements, into = c("x", "y", "z"), sep = "x", convert = TRUE) 
+
+diamonds_new$Clarity <- as.factor(diamonds_new$Clarity)
+diamonds_new$Color <- as.factor(diamonds_new$Color)
+diamonds_new$Cut <- as.factor(diamonds_new$Cut)
+diamonds_new$Shape <- as.factor(diamonds_new$Shape)
+
+# Diamonds can't have zero dimensions if they exist
+zero_dimensions_new <- diamonds_new[diamonds_new$x == 0 | diamonds_new$y == 0 | diamonds_new$z == 0, ]
+
+diamonds_new$x[diamonds_new$x == 0] <- NA
+diamonds_new$y[diamonds_new$y == 0] <- NA
+diamonds_new$z[diamonds_new$z == 0] <- NA
+
+diamonds_new <- diamonds_new %>%
+  select(-Cert, -Known_Conflict_Diamond, -Polish, -Regions, -Symmetry, -Vendor, -Retail, -LogRetail, -LogPrice) %>%
+  rename_with(tolower) %>%
+  rename(ID = id) %>%
+  rename(carat = carats) %>%
+  mutate(
+    volume = x*y*z,
+    clarity = as.factor(clarity),
+    color = as.factor(color),
+    cut = as.factor(cut),
+    shape = as.factor(shape),
+    surface_area = 4 * pi * ((x^1.6075 * y^1.6075 + x^1.6075 * z^1.6075 + y^1.6075 * z^1.6075) / 3)^(1/1.6075)) %>%
+  select(-x,-y,-z)
+
+levels(diamonds_new$clarity)
+levels(diamonds_new$color)
+levels(diamonds_new$cut)
+levels(diamonds_new$shape)
+
+k_rule_of_thumb_new <- round(sqrt(nrow(diamonds_new))) 
+
+diamonds_new_recipe <- recipe(price ~ ., data = diamonds_new) %>%
+  update_role(ID, new_role = "ID") %>%
+  step_novel(all_nominal_predictors(), new_level = "Other") %>%
+  step_impute_knn(all_predictors(), neighbors = k_rule_of_thumb_new) %>%
+  step_normalize(all_numeric_predictors()) %>%
+  step_dummy(all_nominal_predictors(), -all_outcomes(), one_hot = TRUE)
+
+set.seed(6302)
+test_data_prepared <- bake(prep(diamonds_recipe, training = diamonds_train), new_data = diamonds_new)
+
+new_fit <- fit(xgb_wflow2, data = test_data_prepared)
+
+# Now, you can predict as shown previously
+diamonds_predictions <- predict(new_fit, diamonds_new_prepared)
+print(diamonds_predictions)
+
+results <- diamonds_new %>%
+  select(price) %>%
+  bind_cols(diamonds_predictions %>% rename(predicted_price = .pred)) %>%
+  rename(actual_price = price)
+
+# Calculate RMSE
+rmse_val <- yardstick::metric_set(rmse)(data = results, truth = actual_price, estimate = predicted_price)
+
+# Calculate MAE
+mae_val <- yardstick::metric_set(mae)(data = results, truth = actual_price, estimate = predicted_price)
+
+# Calculate R-squared
+rsq_val <- yardstick::metric_set(rsq)(data = results, truth = actual_price, estimate = predicted_price)
+
+# Print the metrics
+print(rmse_val)
+print(mae_val)
+print(rsq_val)
+```
+
